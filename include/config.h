@@ -34,6 +34,12 @@ constexpr int EXPLORE_SPEED = 120;     // PWM for exploration (slow and safe)
 constexpr int SPEED_RUN_SPEED = 200;   // PWM for speed run
 constexpr int TURN_SPEED = 100;        // PWM for turning
 
+// --- Turn Timing (Step 1: timed turns, no encoder dependency) ---
+// Increase if the mouse turns less than 90 degrees.
+// Decrease if the mouse turns more than 90 degrees.
+// Start with 500ms, observe result, and tune.
+constexpr int TURN_TIME_MS = 500;
+
 // --- PID Controller (Straight line) ---
 constexpr float PID_KP = 2.0f;    // Proportional gain
 constexpr float PID_KI = 0.0f;    // Integral gain (start at 0)

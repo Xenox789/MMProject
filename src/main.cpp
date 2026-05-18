@@ -1,16 +1,22 @@
 // ============================================================
-//  Micromouse - Flood Fill Maze Solver
-//  
-//  Controls:
-//    - Press button once: Start EXPLORATION (find the center)
-//    - Press button again: Start SPEED RUN (optimal path)
-//    - Hold button 2s: Sensor calibration mode
-//  
-//  LED Status:
-//    - LED1 blinks slowly: IDLE, waiting for button
-//    - LED1 solid: EXPLORING maze
-//    - LED2 solid: SPEED RUN
-//    - Both LEDs blink fast: ERROR (fault/low battery)
+//  Micromouse - Step 1: Keyboard Control + Sensor Monitor
+//
+//  Serial commands (115200 baud, send single character):
+//    W - Move forward  (press any key to stop)
+//    S - Move backward (press any key to stop)
+//    A - Rotate left 90 degrees  (blocks until done, then re-enables input)
+//    D - Rotate right 90 degrees (blocks until done, then re-enables input)
+//    X - Emergency stop
+//    P - Print raw sensor values (for tuning thresholds)
+//    E - Print encoder counts (for verifying encoders)
+//
+//  Sensor crossection is logged after every turn and every stop.
+//  Tune FRONT_WALL_THRESHOLD and SIDE_WALL_THRESHOLD in config.h
+//  based on "P" output before trusting crossection output.
+//
+//  TURN TUNING:
+//    Adjust TURN_TIME_MS in config.h until A/D produces exactly
+//    90 degrees of rotation on your surface.
 // ============================================================
 
 #include <Arduino.h>
@@ -18,378 +24,253 @@
 #include "config.h"
 #include "motors.h"
 #include "sensors.h"
-#include "maze.h"
 
-// ---- State Machine ----
+// ---- State ----
 enum State {
-  STATE_IDLE,          // Waiting for button press
-  STATE_EXPLORING,     // Flood-fill exploration to center
-  STATE_RETURNING,     // Return to start after reaching center
-  STATE_READY,         // At start, ready for speed run
-  STATE_SPEED_RUN,     // Fast run to center
-  STATE_CALIBRATE,     // Sensor calibration mode
-  STATE_ERROR          // Error state (fault, low battery)
+  STATE_IDLE,
+  STATE_MOVING_FORWARD,
+  STATE_MOVING_BACKWARD,
+  STATE_TURNING_LEFT,
+  STATE_TURNING_RIGHT
 };
 
 State currentState = STATE_IDLE;
-
-// ---- Mouse position and heading ----
-int mouseX = 0;
-int mouseY = 0;
-Direction mouseHeading = NORTH;
-
-// ---- Button ----
-bool buttonPressed();
-unsigned long lastButtonTime = 0;
 
 // ---- LED helpers ----
 void setLED1(bool on) { digitalWrite(PIN::DEBUG_LED_1, on ? HIGH : LOW); }
 void setLED2(bool on) { digitalWrite(PIN::DEBUG_LED_2, on ? HIGH : LOW); }
 
-// ---- Forward declarations ----
-void executeMove(Direction targetDir, int speed);
-void exploreStep();
-void speedRunStep();
-void calibrateMode();
+// ---- Crossection detection and logging ----
+// Reads sensors and logs which directions are open (no wall).
+void logCrossection() {
+  SensorValues sv = Sensors::readAll();
+  WallInfo walls = Sensors::detectWalls();
+
+  Serial.print("[Sensors] FL:");
+  Serial.print(sv.frontLeft);
+  Serial.print(" FR:"); Serial.print(sv.frontRight);
+  Serial.print(" SL:"); Serial.print(sv.sideLeft);
+  Serial.print(" SR:"); Serial.println(sv.sideRight);
+
+  bool openFront = !walls.front;
+  bool openLeft  = !walls.left;
+  bool openRight = !walls.right;
+  int openCount  = (openFront ? 1 : 0) + (openLeft ? 1 : 0) + (openRight ? 1 : 0);
+
+  if (openCount == 0) {
+    Serial.println("[Crossection] Dead end - all directions blocked");
+    return;
+  }
+
+  Serial.print("[Crossection] Open: [");
+  bool first = true;
+  if (openFront) { Serial.print("Straight"); first = false; }
+  if (openLeft)  { if (!first) Serial.print(", "); Serial.print("Left");  first = false; }
+  if (openRight) { if (!first) Serial.print(", "); Serial.print("Right"); }
+  Serial.println("]");
+}
+
+// ---- Timed turn ----
+// Uses time instead of encoders because the right encoder ISR is not yet
+// verified. Tune CONFIG::TURN_TIME_MS in config.h until turns are 90 degrees.
+void executeTurnLeft() {
+  Serial.println("[Turn] Rotating LEFT 90 degrees...");
+  setLED1(true);
+  setLED2(false);
+  Motors::resetEncoders();
+
+  // Right wheel forward, left wheel backward = rotate CCW (left)
+  Motors::setLeftMotor(-CONFIG::TURN_SPEED);
+  Motors::setRightMotor(CONFIG::TURN_SPEED);
+  delay(CONFIG::TURN_TIME_MS);
+  Motors::stop();
+  delay(100);  // Settle
+
+  Serial.print("[Encoders after turn] L:");
+  Serial.print(Motors::getLeftEncoder());
+  Serial.print(" R:");
+  Serial.println(Motors::getRightEncoder());
+
+  setLED1(false);
+  Serial.println("[Turn] Done.");
+}
+
+void executeTurnRight() {
+  Serial.println("[Turn] Rotating RIGHT 90 degrees...");
+  setLED1(false);
+  setLED2(true);
+  Motors::resetEncoders();
+
+  // Left wheel forward, right wheel backward = rotate CW (right)
+  Motors::setLeftMotor(CONFIG::TURN_SPEED);
+  Motors::setRightMotor(-CONFIG::TURN_SPEED);
+  delay(CONFIG::TURN_TIME_MS);
+  Motors::stop();
+  delay(100);  // Settle
+
+  Serial.print("[Encoders after turn] L:");
+  Serial.print(Motors::getLeftEncoder());
+  Serial.print(" R:");
+  Serial.println(Motors::getRightEncoder());
+
+  setLED2(false);
+  Serial.println("[Turn] Done.");
+}
 
 // ============================================================
 void setup() {
   Serial.begin(115200);
+  delay(500);  // Wait for USB CDC to connect
+
   Serial.println();
-  Serial.println("================================");
-  Serial.println("  Micromouse v1.0 - Flood Fill");
-  Serial.println("================================");
-  
-  // Button
-  pinMode(PIN::BTN, INPUT_PULLUP);
-  
-  // Debug LEDs
+  Serial.println("======================================");
+  Serial.println("  Micromouse - Step 1: Keyboard Mode");
+  Serial.println("======================================");
+  Serial.println("  W = Forward    S = Backward");
+  Serial.println("  A = Left 90    D = Right 90");
+  Serial.println("  X = Stop       P = Print sensors");
+  Serial.println("  E = Print encoders");
+  Serial.println("======================================");
+
   pinMode(PIN::DEBUG_LED_1, OUTPUT);
   pinMode(PIN::DEBUG_LED_2, OUTPUT);
   setLED1(false);
   setLED2(false);
-  
-  // Initialize subsystems
+
   Motors::init();
   Sensors::init();
-  Maze::init();
-  
-  // Enable motors
   Motors::enable();
-  
-  // Check for faults immediately
+
   if (Motors::isFault()) {
     Serial.println("!!! MOTOR DRIVER FAULT at startup !!!");
-    currentState = STATE_ERROR;
+    Serial.println("    Check EN/FAULT wiring. Sensors still work.");
   }
-  
-  // Check battery
+
+  int batt = Sensors::readBatteryRaw();
+  Serial.print("Battery ADC: "); Serial.println(batt);
   if (Sensors::isBatteryLow()) {
-    Serial.println("!!! LOW BATTERY !!!");
-    currentState = STATE_ERROR;
+    Serial.println("WARNING: Battery may be low.");
   }
-  
-  Serial.println("Ready. Press button to start exploration.");
-  Serial.print("Battery: "); Serial.println(Sensors::readBatteryRaw());
+
+  Serial.println();
+  Serial.println("Ready. Send P first to read sensor values and tune thresholds.");
 }
 
 // ============================================================
 void loop() {
-  switch (currentState) {
-    
-    // ---- IDLE: Blink LED, wait for button ----
-    case STATE_IDLE: {
-      // Slow blink LED1
-      setLED1((millis() / 500) % 2);
-      setLED2(false);
-      
-      if (buttonPressed()) {
-        // Check for long press (calibrate mode)
-        unsigned long pressStart = millis();
-        while (digitalRead(PIN::BTN) == LOW) {
-          if (millis() - pressStart > 2000) {
-            currentState = STATE_CALIBRATE;
-            Serial.println(">> Entering CALIBRATION mode");
-            return;
-          }
-        }
-        
-        Serial.println(">> Starting EXPLORATION");
-        Serial.println("   Starting in 1 second...");
-        setLED1(true);
-        delay(CONFIG::STARTUP_DELAY_MS);
-        
-        // Reset position
-        mouseX = 0;
-        mouseY = 0;
-        mouseHeading = NORTH;
-        
-        // Initialize maze (clear old data)
-        Maze::init();
-        
-        currentState = STATE_EXPLORING;
-      }
-      break;
-    }
-    
-    // ---- EXPLORING: Navigate to center using flood-fill ----
-    case STATE_EXPLORING: {
-      setLED1(true);
-      setLED2(false);
-      
-      // Check for errors
-      if (Motors::isFault()) {
-        Serial.println("FAULT during exploration!");
-        Motors::stop();
-        currentState = STATE_ERROR;
-        break;
-      }
-      
-      if (Sensors::isBatteryLow()) {
-        Serial.println("Low battery during exploration!");
-        Motors::stop();
-        currentState = STATE_ERROR;
-        break;
-      }
-      
-      // Execute one exploration step
-      exploreStep();
-      
-      // Check if we reached the goal
-      if (Maze::isGoal(mouseX, mouseY)) {
-        Motors::stop();
-        Serial.println("=============================");
-        Serial.println("  GOAL REACHED!");
-        Serial.println("=============================");
-        Maze::printMaze();
-        
-        Serial.println(">> Returning to start...");
-        delay(500);
-        currentState = STATE_RETURNING;
-      }
-      break;
-    }
-    
-    // ---- RETURNING: Navigate back to (0,0) ----
-    case STATE_RETURNING: {
-      setLED1((millis() / 200) % 2);  // Fast blink
-      setLED2(false);
-      
-      if (Motors::isFault() || Sensors::isBatteryLow()) {
-        Motors::stop();
-        currentState = STATE_ERROR;
-        break;
-      }
-      
-      // Flood fill targeting start
-      Maze::floodFillToStart();
-      
-      // Read walls and update maze
-      WallInfo wi = Sensors::detectWalls();
-      Maze::updateWalls(mouseX, mouseY, mouseHeading, wi);
-      
-      // Find best direction
-      Direction targetDir = Maze::bestDirection(mouseX, mouseY, mouseHeading);
-      
-      // Execute the move
-      executeMove(targetDir, CONFIG::EXPLORE_SPEED);
-      
-      // Check if we're back at start
-      if (mouseX == 0 && mouseY == 0) {
-        Motors::stop();
-        Serial.println("=============================");
-        Serial.println("  BACK AT START!");
-        Serial.println("  Press button for SPEED RUN");
-        Serial.println("=============================");
-        currentState = STATE_READY;
-      }
-      break;
-    }
-    
-    // ---- READY: At start, waiting for speed run ----
-    case STATE_READY: {
-      setLED1(false);
-      setLED2((millis() / 500) % 2);  // Blink LED2
-      
-      if (buttonPressed()) {
-        Serial.println(">> Starting SPEED RUN");
-        Serial.println("   Starting in 1 second...");
-        setLED2(true);
-        delay(CONFIG::STARTUP_DELAY_MS);
-        
-        mouseX = 0;
-        mouseY = 0;
-        mouseHeading = NORTH;
-        
-        // Flood fill to goal with all discovered walls
-        Maze::floodFill(CONFIG::GOAL_X1, CONFIG::GOAL_Y1,
-                        CONFIG::GOAL_X2, CONFIG::GOAL_Y2);
-        
-        currentState = STATE_SPEED_RUN;
-      }
-      break;
-    }
-    
-    // ---- SPEED RUN: Fast navigation on known path ----
-    case STATE_SPEED_RUN: {
-      setLED1(false);
-      setLED2(true);
-      
-      if (Motors::isFault() || Sensors::isBatteryLow()) {
-        Motors::stop();
-        currentState = STATE_ERROR;
-        break;
-      }
-      
-      speedRunStep();
-      
-      if (Maze::isGoal(mouseX, mouseY)) {
-        Motors::stop();
-        Serial.println("=============================");
-        Serial.println("  SPEED RUN COMPLETE!");
-        Serial.println("=============================");
-        currentState = STATE_IDLE;
-      }
-      break;
-    }
-    
-    // ---- CALIBRATE: Print sensor values for tuning ----
-    case STATE_CALIBRATE: {
-      setLED1(true);
-      setLED2(true);
-      
-      Sensors::printValues();
-      delay(200);
-      
-      if (buttonPressed()) {
-        Serial.println(">> Exiting calibration");
-        currentState = STATE_IDLE;
-      }
-      break;
-    }
-    
-    // ---- ERROR: Flash both LEDs ----
-    case STATE_ERROR: {
+
+  // ---- Read serial input ----
+  if (Serial.available()) {
+    char cmd = (char)Serial.read();
+    while (Serial.available()) Serial.read();  // Flush newline/extra bytes
+
+    // Emergency stop always works
+    if (cmd == 'x' || cmd == 'X') {
       Motors::stop();
-      bool on = (millis() / 150) % 2;
-      setLED1(on);
-      setLED2(on);
-      
-      // Print error info periodically
-      static unsigned long lastPrint = 0;
-      if (millis() - lastPrint > 2000) {
-        lastPrint = millis();
-        Serial.print("ERROR - Fault: "); Serial.print(Motors::isFault());
-        Serial.print(" Battery: ");      Serial.println(Sensors::readBatteryRaw());
-      }
-      
-      // Button press to return to idle
-      if (buttonPressed()) {
+      currentState = STATE_IDLE;
+      setLED1(false);
+      setLED2(false);
+      Serial.println("[Stop] Emergency stopped.");
+      logCrossection();
+      return;
+    }
+
+    // Debug commands work in any state
+    if (cmd == 'p' || cmd == 'P') {
+      SensorValues sv = Sensors::readAll();
+      Serial.print("[Sensors] FL:"); Serial.print(sv.frontLeft);
+      Serial.print(" FR:"); Serial.print(sv.frontRight);
+      Serial.print(" SL:"); Serial.print(sv.sideLeft);
+      Serial.print(" SR:"); Serial.print(sv.sideRight);
+      Serial.print(" BAT:"); Serial.println(Sensors::readBatteryRaw());
+      Serial.print("  FRONT_WALL_THRESHOLD="); Serial.print(CONFIG::FRONT_WALL_THRESHOLD);
+      Serial.print("  SIDE_WALL_THRESHOLD="); Serial.println(CONFIG::SIDE_WALL_THRESHOLD);
+      return;
+    }
+
+    if (cmd == 'e' || cmd == 'E') {
+      Serial.print("[Encoders] L:");
+      Serial.print(Motors::getLeftEncoder());
+      Serial.print(" R:");
+      Serial.println(Motors::getRightEncoder());
+      return;
+    }
+
+    // Movement commands
+    switch (currentState) {
+
+      case STATE_IDLE:
+        if (cmd == 'w' || cmd == 'W') {
+          Serial.println("[Move] Moving FORWARD. Press any key to stop.");
+          currentState = STATE_MOVING_FORWARD;
+          setLED1(true); setLED2(false);
+          Motors::resetEncoders();
+          Motors::setLeftMotor(CONFIG::EXPLORE_SPEED);
+          Motors::setRightMotor(CONFIG::EXPLORE_SPEED);
+
+        } else if (cmd == 's' || cmd == 'S') {
+          Serial.println("[Move] Moving BACKWARD. Press any key to stop.");
+          currentState = STATE_MOVING_BACKWARD;
+          setLED1(false); setLED2(true);
+          Motors::resetEncoders();
+          Motors::setLeftMotor(-CONFIG::EXPLORE_SPEED);
+          Motors::setRightMotor(-CONFIG::EXPLORE_SPEED);
+
+        } else if (cmd == 'a' || cmd == 'A') {
+          currentState = STATE_TURNING_LEFT;
+          executeTurnLeft();
+          currentState = STATE_IDLE;
+          logCrossection();
+
+        } else if (cmd == 'd' || cmd == 'D') {
+          currentState = STATE_TURNING_RIGHT;
+          executeTurnRight();
+          currentState = STATE_IDLE;
+          logCrossection();
+
+        } else {
+          Serial.println("[?] W=Fwd S=Back A=Left90 D=Right90 X=Stop P=Sensors E=Encoders");
+        }
+        break;
+
+      // Any key press while moving = stop
+      case STATE_MOVING_FORWARD:
+      case STATE_MOVING_BACKWARD:
+        Motors::stop();
         currentState = STATE_IDLE;
+        setLED1(false); setLED2(false);
+        Serial.println("[Stop] Stopped.");
+        Serial.print("[Encoders] L:");
+        Serial.print(Motors::getLeftEncoder());
+        Serial.print(" R:");
+        Serial.println(Motors::getRightEncoder());
+        logCrossection();
+        break;
+
+      case STATE_TURNING_LEFT:
+      case STATE_TURNING_RIGHT:
+        // Turning is blocking, this case is never reached in practice
+        break;
+    }
+  }
+
+  // ---- Periodic sensor readout while moving ----
+  // Prints every 300ms so you can watch values change as the mouse
+  // approaches walls. This helps tune FRONT_WALL_THRESHOLD.
+  static unsigned long lastSensorPrint = 0;
+  if (currentState == STATE_MOVING_FORWARD || currentState == STATE_MOVING_BACKWARD) {
+    unsigned long now = millis();
+    if (now - lastSensorPrint >= 300) {
+      lastSensorPrint = now;
+      SensorValues sv = Sensors::readAll();
+      Serial.print("[Moving] FL:"); Serial.print(sv.frontLeft);
+      Serial.print(" FR:"); Serial.print(sv.frontRight);
+      Serial.print(" SL:"); Serial.print(sv.sideLeft);
+      Serial.print(" SR:"); Serial.print(sv.sideRight);
+      if ((sv.frontLeft + sv.frontRight) > CONFIG::FRONT_WALL_THRESHOLD) {
+        Serial.print(" *** WALL AHEAD ***");
       }
-      break;
+      Serial.println();
     }
   }
-}
-
-// ============================================================
-//  EXPLORATION STEP
-//  - Read walls at current position
-//  - Update maze
-//  - Run flood fill
-//  - Move to the cell with the lowest flood value
-// ============================================================
-void exploreStep() {
-  // 1) Read walls
-  WallInfo wi = Sensors::detectWalls();
-  
-  // 2) Update maze with discovered walls
-  Maze::updateWalls(mouseX, mouseY, mouseHeading, wi);
-  
-  Serial.print("Pos: ("); Serial.print(mouseX);
-  Serial.print(",");      Serial.print(mouseY);
-  Serial.print(") Heading: "); Serial.print(mouseHeading);
-  Serial.print(" Walls F:"); Serial.print(wi.front);
-  Serial.print(" L:");       Serial.print(wi.left);
-  Serial.print(" R:");       Serial.println(wi.right);
-  
-  // 3) Run flood fill to the goal
-  Maze::floodFill(CONFIG::GOAL_X1, CONFIG::GOAL_Y1,
-                  CONFIG::GOAL_X2, CONFIG::GOAL_Y2);
-  
-  // 4) Find best direction
-  Direction targetDir = Maze::bestDirection(mouseX, mouseY, mouseHeading);
-  
-  Serial.print("  Flood value: "); Serial.print(Maze::getFloodValue(mouseX, mouseY));
-  Serial.print(" -> Moving: ");    Serial.println(targetDir);
-  
-  // 5) Execute the move
-  executeMove(targetDir, CONFIG::EXPLORE_SPEED);
-}
-
-// ============================================================
-//  SPEED RUN STEP
-//  Uses pre-computed flood values (no re-computation each cell)
-// ============================================================
-void speedRunStep() {
-  // We already have the flood map calculated
-  Direction targetDir = Maze::bestDirection(mouseX, mouseY, mouseHeading);
-  executeMove(targetDir, CONFIG::SPEED_RUN_SPEED);
-}
-
-// ============================================================
-//  EXECUTE MOVE
-//  Turn to face the target direction, then move forward one cell
-// ============================================================
-void executeMove(Direction targetDir, int speed) {
-  RelativeDir turn = Maze::getRelativeTurn(mouseHeading, targetDir);
-  
-  // Execute the required turn
-  switch (turn) {
-    case REL_FORWARD:
-      // No turn needed
-      break;
-    case REL_RIGHT:
-      Motors::turnRight90(CONFIG::TURN_SPEED);
-      break;
-    case REL_LEFT:
-      Motors::turnLeft90(CONFIG::TURN_SPEED);
-      break;
-    case REL_BACK:
-      Motors::turnAround(CONFIG::TURN_SPEED);
-      break;
-  }
-  
-  // Update heading
-  mouseHeading = targetDir;
-  
-  // Move forward one cell
-  Motors::moveForwardCells(1, speed);
-  
-  // Update position
-  int nx, ny;
-  Maze::getNextCell(mouseX, mouseY, mouseHeading, nx, ny);
-  
-  // Sanity check (should never happen if maze is correct)
-  if (nx < 0 || nx >= CONFIG::MAZE_SIZE || ny < 0 || ny >= CONFIG::MAZE_SIZE) {
-    Serial.println("ERROR: Moved out of bounds!");
-    currentState = STATE_ERROR;
-    return;
-  }
-  
-  mouseX = nx;
-  mouseY = ny;
-}
-
-// ============================================================
-//  BUTTON HELPER
-// ============================================================
-bool buttonPressed() {
-  if (digitalRead(PIN::BTN) == LOW) {
-    if (millis() - lastButtonTime > CONFIG::BUTTON_DEBOUNCE_MS) {
-      lastButtonTime = millis();
-      return true;
-    }
-  }
-  return false;
 }

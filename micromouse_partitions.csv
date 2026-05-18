@@ -1,0 +1,4 @@
+# Name,   Type, SubType,  Offset,  Size, Flags
+nvs,      data, nvs,      36K,     20K,
+app,      app,  factory,  64K,     3968K,
+coredump, data, coredump, 4032K,   64K,

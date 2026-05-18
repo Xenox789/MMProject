@@ -3,119 +3,117 @@
 //
 //  Implementation notes
 //  --------------------
-//  * ESP-IDF v5 (used by Arduino-ESP32 v3) ships a new "pulse_cnt" driver
-//    (driver/pulse_cnt.h) which is what we use here.  It supports x4
-//    decoding natively via two channels per unit configured with the A/B
-//    inputs swapped on edge/level inputs.
+//  * Uses the legacy ESP-IDF v4 "driver/pcnt.h" API which is available in
+//    the Arduino-ESP32 framework bundled by PlatformIO.
+//  * Quadrature x4 decoding: two channels per unit, A/B swapped on
+//    edge/level inputs.
 //  * The chip's hardware counter is 16-bit signed (-32768 ... +32767).  We
-//    install an overflow watcher so we accumulate into a 64-bit running
-//    total in software.
+//    install H_LIM / L_LIM event interrupts to accumulate into a 64-bit
+//    running total in software.
 // ============================================================================
 
 #include "hal/encoder.h"
 #include "constants.h"
 #include "pins.h"
 
-#include "driver/pulse_cnt.h"
+#include "driver/pcnt.h"
 #include <esp_attr.h>
 
 namespace hal {
 
 namespace {
 
-constexpr int PCNT_HIGH_LIMIT =  10000;
-constexpr int PCNT_LOW_LIMIT  = -10000;
+constexpr int16_t PCNT_HIGH_LIMIT =  10000;
+constexpr int16_t PCNT_LOW_LIMIT  = -10000;
 
 struct UnitState {
-    pcnt_unit_handle_t unit = nullptr;
-    pcnt_channel_handle_t chan_a = nullptr;
-    pcnt_channel_handle_t chan_b = nullptr;
+    pcnt_unit_t unit;
     volatile int64_t accumulated = 0;     // total ticks since reset
 };
 
 UnitState g_left;
 UnitState g_right;
 
-bool IRAM_ATTR on_watch(pcnt_unit_handle_t unit,
-                        const pcnt_watch_event_data_t *edata,
-                        void *user_ctx) {
-    auto *st = static_cast<UnitState*>(user_ctx);
-    // We installed watchpoints at +/- LIMIT; when fired, the hardware count
-    // has already snapped back near zero, so credit the limit value.
-    st->accumulated += edata->watch_point_value;
-    return false; // do not yield from ISR
+static bool g_isr_installed = false;
+
+static void IRAM_ATTR pcnt_isr_handler(void *arg) {
+    auto *st = static_cast<UnitState*>(arg);
+    uint32_t status = 0;
+    pcnt_get_event_status(st->unit, &status);
+    if (status & PCNT_EVT_H_LIM) {
+        st->accumulated += PCNT_HIGH_LIMIT;
+    }
+    if (status & PCNT_EVT_L_LIM) {
+        st->accumulated += PCNT_LOW_LIMIT;
+    }
 }
 
-void install_unit(UnitState &st, int pin_a, int pin_b, bool invert) {
-    pcnt_unit_config_t unit_cfg = {
-        .low_limit  = PCNT_LOW_LIMIT,
-        .high_limit = PCNT_HIGH_LIMIT,
-        .intr_priority = 0,
-        .flags = {.accum_count = 0},
-    };
-    pcnt_new_unit(&unit_cfg, &st.unit);
+void install_unit(UnitState &st, pcnt_unit_t unit, int pin_a, int pin_b, bool invert) {
+    st.unit = unit;
+    st.accumulated = 0;
 
-    // Channel A: edge = pin_a, level = pin_b
-    pcnt_chan_config_t chan_a_cfg = {
-        .edge_gpio_num  = pin_a,
-        .level_gpio_num = pin_b,
-        .flags = {},
-    };
-    pcnt_new_channel(st.unit, &chan_a_cfg, &st.chan_a);
+    // Channel 0: edge on pin_a, level on pin_b
+    pcnt_config_t cfg_a = {};
+    cfg_a.pulse_gpio_num = pin_a;
+    cfg_a.ctrl_gpio_num  = pin_b;
+    cfg_a.unit           = unit;
+    cfg_a.channel        = PCNT_CHANNEL_0;
+    cfg_a.pos_mode       = invert ? PCNT_COUNT_DEC : PCNT_COUNT_INC;
+    cfg_a.neg_mode       = invert ? PCNT_COUNT_INC : PCNT_COUNT_DEC;
+    cfg_a.lctrl_mode     = PCNT_MODE_REVERSE;
+    cfg_a.hctrl_mode     = PCNT_MODE_KEEP;
+    cfg_a.counter_h_lim  = PCNT_HIGH_LIMIT;
+    cfg_a.counter_l_lim  = PCNT_LOW_LIMIT;
+    pcnt_unit_config(&cfg_a);
 
-    // Channel B: edge = pin_b, level = pin_a  (this is what gives x4 decode)
-    pcnt_chan_config_t chan_b_cfg = {
-        .edge_gpio_num  = pin_b,
-        .level_gpio_num = pin_a,
-        .flags = {},
-    };
-    pcnt_new_channel(st.unit, &chan_b_cfg, &st.chan_b);
+    // Channel 1: edge on pin_b, level on pin_a (gives x4 decode)
+    pcnt_config_t cfg_b = {};
+    cfg_b.pulse_gpio_num = pin_b;
+    cfg_b.ctrl_gpio_num  = pin_a;
+    cfg_b.unit           = unit;
+    cfg_b.channel        = PCNT_CHANNEL_1;
+    cfg_b.pos_mode       = invert ? PCNT_COUNT_INC : PCNT_COUNT_DEC;
+    cfg_b.neg_mode       = invert ? PCNT_COUNT_DEC : PCNT_COUNT_INC;
+    cfg_b.lctrl_mode     = PCNT_MODE_REVERSE;
+    cfg_b.hctrl_mode     = PCNT_MODE_KEEP;
+    cfg_b.counter_h_lim  = PCNT_HIGH_LIMIT;
+    cfg_b.counter_l_lim  = PCNT_LOW_LIMIT;
+    pcnt_unit_config(&cfg_b);
 
-    // Edge/level actions: standard quadrature -- A leads B = +1 per edge
-    // (or -1 if 'invert' is true).
-    const pcnt_channel_edge_action_t edge_pos =
-        invert ? PCNT_CHANNEL_EDGE_ACTION_DECREASE
-               : PCNT_CHANNEL_EDGE_ACTION_INCREASE;
-    const pcnt_channel_edge_action_t edge_neg =
-        invert ? PCNT_CHANNEL_EDGE_ACTION_INCREASE
-               : PCNT_CHANNEL_EDGE_ACTION_DECREASE;
+    // Optional glitch filter (APB_CLK ticks, max 1023)
+    pcnt_set_filter_value(unit, 100);
+    pcnt_filter_enable(unit);
 
-    pcnt_channel_set_edge_action(st.chan_a, edge_pos, edge_neg);
-    pcnt_channel_set_level_action(st.chan_a,
-        PCNT_CHANNEL_LEVEL_ACTION_KEEP,
-        PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+    // Enable H_LIM and L_LIM events for overflow accumulation
+    pcnt_event_enable(unit, PCNT_EVT_H_LIM);
+    pcnt_event_enable(unit, PCNT_EVT_L_LIM);
 
-    pcnt_channel_set_edge_action(st.chan_b, edge_neg, edge_pos);
-    pcnt_channel_set_level_action(st.chan_b,
-        PCNT_CHANNEL_LEVEL_ACTION_KEEP,
-        PCNT_CHANNEL_LEVEL_ACTION_INVERSE);
+    // Install shared ISR service once, then add per-unit handler
+    if (!g_isr_installed) {
+        pcnt_isr_service_install(0);
+        g_isr_installed = true;
+    }
+    pcnt_isr_handler_add(unit, pcnt_isr_handler, &st);
 
-    // Watch the limits so we can roll the 16-bit count into our int64.
-    pcnt_unit_add_watch_point(st.unit, PCNT_HIGH_LIMIT);
-    pcnt_unit_add_watch_point(st.unit, PCNT_LOW_LIMIT);
-
-    pcnt_event_callbacks_t cbs = { .on_reach = on_watch };
-    pcnt_unit_register_event_callbacks(st.unit, &cbs, &st);
-
-    pcnt_unit_enable(st.unit);
-    pcnt_unit_clear_count(st.unit);
-    pcnt_unit_start(st.unit);
+    pcnt_counter_pause(unit);
+    pcnt_counter_clear(unit);
+    pcnt_counter_resume(unit);
 }
 
 int64_t read_total(UnitState &st) {
-    int current = 0;
-    pcnt_unit_get_count(st.unit, &current);
+    int16_t current = 0;
+    pcnt_get_counter_value(st.unit, &current);
     return st.accumulated + current;
 }
 
 } // namespace
 
 void Encoders::begin() {
-    install_unit(g_left,
+    install_unit(g_left, PCNT_UNIT_0,
                  PIN::MOTOR_A_ENC_A, PIN::MOTOR_A_ENC_B,
                  CONFIG::MOTOR_A_IS_LEFT ? CONFIG::ENCODER_LEFT_INVERT
                                          : CONFIG::ENCODER_RIGHT_INVERT);
-    install_unit(g_right,
+    install_unit(g_right, PCNT_UNIT_1,
                  PIN::MOTOR_B_ENC_A, PIN::MOTOR_B_ENC_B,
                  CONFIG::MOTOR_A_IS_LEFT ? CONFIG::ENCODER_RIGHT_INVERT
                                          : CONFIG::ENCODER_LEFT_INVERT);
@@ -133,8 +131,12 @@ int64_t Encoders::right_ticks() {
 }
 
 void Encoders::reset() {
-    pcnt_unit_clear_count(g_left.unit);
-    pcnt_unit_clear_count(g_right.unit);
+    pcnt_counter_pause(g_left.unit);
+    pcnt_counter_clear(g_left.unit);
+    pcnt_counter_resume(g_left.unit);
+    pcnt_counter_pause(g_right.unit);
+    pcnt_counter_clear(g_right.unit);
+    pcnt_counter_resume(g_right.unit);
     g_left.accumulated  = 0;
     g_right.accumulated = 0;
     m_last_l = 0;

@@ -21,6 +21,11 @@ struct PidGains {
     float i_clamp = 1e9f;        // max |integral term|
     float out_min = -1e9f;
     float out_max =  1e9f;
+
+    PidGains() = default;
+    PidGains(float kp_, float ki_, float kd_,
+             float i_clamp_ = 1e9f, float out_min_ = -1e9f, float out_max_ = 1e9f)
+        : kp(kp_), ki(ki_), kd(kd_), i_clamp(i_clamp_), out_min(out_min_), out_max(out_max_) {}
 };
 
 class Pid {

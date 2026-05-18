@@ -2,7 +2,7 @@
 #pragma once
 #include <Arduino.h>
 #include "config.h"
-#include "sensors.h"
+#include "sensing/wall_view.h"   // provides ::WallInfo (compat alias)
 
 // Wall bit flags for each cell
 constexpr uint8_t WALL_NORTH = 0x01;

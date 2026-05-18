@@ -1,395 +1,317 @@
-// ============================================================
-//  Micromouse - Flood Fill Maze Solver
-//  
-//  Controls:
-//    - Press button once: Start EXPLORATION (find the center)
-//    - Press button again: Start SPEED RUN (optimal path)
-//    - Hold button 2s: Sensor calibration mode
-//  
-//  LED Status:
-//    - LED1 blinks slowly: IDLE, waiting for button
-//    - LED1 solid: EXPLORING maze
-//    - LED2 solid: SPEED RUN
-//    - Both LEDs blink fast: ERROR (fault/low battery)
-// ============================================================
+// ============================================================================
+//  main.cpp  --  Micromouse top-level state machine.
+//
+//  Architecture
+//  ------------
+//  Arduino loop() runs the BEHAVIOUR state machine (idle / explore / return /
+//  speed-run / calibrate / error).  Whenever it needs to physically move,
+//  it talks to mouse::g_mouse -- the facade that hides motors, encoders,
+//  IR, IMU and the high-rate control loops.
+//
+//  Two FreeRTOS tasks run beneath us:
+//      * "ctrl"   on core 1, CONTROL_LOOP_HZ : odometry + planner + motor PID
+//      * "sense"  on core 0, SENSING_LOOP_HZ : IR sampling + wall detection
+//
+//  All tuning happens in include/constants.h.
+// ============================================================================
 
 #include <Arduino.h>
+
 #include "pins.h"
-#include "config.h"
-#include "motors.h"
-#include "sensors.h"
+#include "constants.h"
+#include "mouse.h"
 #include "maze.h"
 
-// ---- State Machine ----
-enum State {
-  STATE_IDLE,          // Waiting for button press
-  STATE_EXPLORING,     // Flood-fill exploration to center
-  STATE_RETURNING,     // Return to start after reaching center
-  STATE_READY,         // At start, ready for speed run
-  STATE_SPEED_RUN,     // Fast run to center
-  STATE_CALIBRATE,     // Sensor calibration mode
-  STATE_ERROR          // Error state (fault, low battery)
+namespace {
+
+// ----- High-level state ------------------------------------------------------
+enum class AppState : uint8_t {
+    Idle,
+    Exploring,
+    Returning,
+    Ready,
+    SpeedRun,
+    Calibrate,
+    Error
 };
 
-State currentState = STATE_IDLE;
+AppState g_state = AppState::Idle;
 
-// ---- Mouse position and heading ----
-int mouseX = 0;
-int mouseY = 0;
-Direction mouseHeading = NORTH;
+// Mouse pose in MAZE coords (cell indices + cardinal heading) -- maintained
+// by the behaviour layer.  The control layer's continuous pose is metric and
+// independent.
+int       g_cell_x  = 0;
+int       g_cell_y  = 0;
+Direction g_heading = NORTH;
 
-// ---- Button ----
-bool buttonPressed();
-unsigned long lastButtonTime = 0;
+// Button debouncing
+unsigned long g_last_btn_ms = 0;
+bool button_pressed() {
+    if (digitalRead(PIN::BTN) == LOW &&
+        millis() - g_last_btn_ms > CONFIG::BUTTON_DEBOUNCE_MS) {
+        g_last_btn_ms = millis();
+        return true;
+    }
+    return false;
+}
 
-// ---- LED helpers ----
-void setLED1(bool on) { digitalWrite(PIN::DEBUG_LED_1, on ? HIGH : LOW); }
-void setLED2(bool on) { digitalWrite(PIN::DEBUG_LED_2, on ? HIGH : LOW); }
+inline void led1(bool on) { digitalWrite(PIN::DEBUG_LED_1, on ? HIGH : LOW); }
+inline void led2(bool on) { digitalWrite(PIN::DEBUG_LED_2, on ? HIGH : LOW); }
 
-// ---- Forward declarations ----
-void executeMove(Direction targetDir, int speed);
-void exploreStep();
-void speedRunStep();
-void calibrateMode();
+// ----- Mapping from a maze RelativeDir to a Mouse turn primitive -------------
+void execute_relative_turn(RelativeDir rd) {
+    using mouse::TurnDirection;
+    switch (rd) {
+    case REL_FORWARD: /* no-op */ return;
+    case REL_RIGHT:   mouse::g_mouse.turn(TurnDirection::Right,  CONFIG::TURN_SPEED_MMPS); break;
+    case REL_LEFT:    mouse::g_mouse.turn(TurnDirection::Left,   CONFIG::TURN_SPEED_MMPS); break;
+    case REL_BACK:    mouse::g_mouse.turn(TurnDirection::Around, CONFIG::TURN_SPEED_MMPS); break;
+    }
+    mouse::g_mouse.wait_until_done(2000);
+}
 
-// ============================================================
+// ----- One "cell-step": sense, decide, turn, advance ------------------------
+void cell_step(float cruise_mmps) {
+    // 1) sense walls AT current cell (already centred from previous move)
+    WallInfo wi = mouse::g_mouse.walls();   // implicit ctor from WallView
+    Maze::updateWalls(g_cell_x, g_cell_y, g_heading, wi);
+
+    Serial.printf("Pos (%d,%d)  hdg=%d  walls F=%d L=%d R=%d\n",
+                  g_cell_x, g_cell_y, (int)g_heading,
+                  wi.front, wi.left, wi.right);
+
+    // 2) plan
+    Maze::floodFill(CONFIG::GOAL_X1, CONFIG::GOAL_Y1,
+                    CONFIG::GOAL_X2, CONFIG::GOAL_Y2);
+    Direction target = Maze::bestDirection(g_cell_x, g_cell_y, g_heading);
+    RelativeDir rd   = Maze::getRelativeTurn(g_heading, target);
+
+    // 3) execute turn (if any), then move forward one cell
+    execute_relative_turn(rd);
+    g_heading = target;
+
+    mouse::g_mouse.forward_cells(1, cruise_mmps);
+    auto res = mouse::g_mouse.wait_until_done(5000);
+    if (res == mouse::MotionResult::BlockedByWall) {
+        // Front wall surprise -- mark it and abort the step; flood-fill will
+        // re-plan from the same cell on the next iteration.
+        Maze::setWall(g_cell_x, g_cell_y, g_heading);
+        return;
+    }
+    if (res == mouse::MotionResult::Aborted) {
+        g_state = AppState::Error;
+        return;
+    }
+
+    // 4) advance the maze-coord state
+    int nx, ny;
+    Maze::getNextCell(g_cell_x, g_cell_y, g_heading, nx, ny);
+    if (nx < 0 || nx >= CONFIG::MAZE_SIZE || ny < 0 || ny >= CONFIG::MAZE_SIZE) {
+        Serial.println("ERROR: out of bounds!");
+        g_state = AppState::Error;
+        return;
+    }
+    g_cell_x = nx;
+    g_cell_y = ny;
+}
+
+void reset_pose_to_start() {
+    g_cell_x = 0;
+    g_cell_y = 0;
+    g_heading = NORTH;
+}
+
+} // namespace
+
+
+// ============================================================================
+//  setup / loop
+// ============================================================================
+
 void setup() {
-  Serial.begin(115200);
-  Serial.println();
-  Serial.println("================================");
-  Serial.println("  Micromouse v1.0 - Flood Fill");
-  Serial.println("================================");
-  
-  // Button
-  pinMode(PIN::BTN, INPUT_PULLUP);
-  
-  // Debug LEDs
-  pinMode(PIN::DEBUG_LED_1, OUTPUT);
-  pinMode(PIN::DEBUG_LED_2, OUTPUT);
-  setLED1(false);
-  setLED2(false);
-  
-  // Initialize subsystems
-  Motors::init();
-  Sensors::init();
-  Maze::init();
-  
-  // Enable motors
-  Motors::enable();
-  
-  // Check for faults immediately
-  if (Motors::isFault()) {
-    Serial.println("!!! MOTOR DRIVER FAULT at startup !!!");
-    currentState = STATE_ERROR;
-  }
-  
-  // Check battery
-  if (Sensors::isBatteryLow()) {
-    Serial.println("!!! LOW BATTERY !!!");
-    currentState = STATE_ERROR;
-  }
-  
-  Serial.println("Ready. Press button to start exploration.");
-  Serial.print("Battery: "); Serial.println(Sensors::readBatteryRaw());
+    Serial.begin(115200);
+    delay(100);
+    Serial.println("\n==============================");
+    Serial.println("  Micromouse  --  layered fw  ");
+    Serial.println("==============================");
+
+    pinMode(PIN::BTN,         INPUT_PULLUP);
+    pinMode(PIN::DEBUG_LED_1, OUTPUT);
+    pinMode(PIN::DEBUG_LED_2, OUTPUT);
+
+    Maze::init();
+
+    if (!mouse::g_mouse.begin()) {
+        Serial.println("[main] mouse bring-up failed; entering ERROR");
+        g_state = AppState::Error;
+        return;
+    }
+
+    mouse::g_mouse.enable_motors();
+
+    if (mouse::g_mouse.motor_fault()) {
+        Serial.println("[main] motor FAULT at boot");
+        g_state = AppState::Error;
+    } else if (mouse::g_mouse.battery_low()) {
+        Serial.println("[main] battery LOW at boot");
+        g_state = AppState::Error;
+    } else {
+        Serial.println("Ready. Press BTN to start exploration.");
+    }
 }
 
-// ============================================================
 void loop() {
-  switch (currentState) {
-    
-    // ---- IDLE: Blink LED, wait for button ----
-    case STATE_IDLE: {
-      // Slow blink LED1
-      setLED1((millis() / 500) % 2);
-      setLED2(false);
-      
-      if (buttonPressed()) {
-        // Check for long press (calibrate mode)
-        unsigned long pressStart = millis();
-        while (digitalRead(PIN::BTN) == LOW) {
-          if (millis() - pressStart > 2000) {
-            currentState = STATE_CALIBRATE;
-            Serial.println(">> Entering CALIBRATION mode");
-            return;
-          }
+    switch (g_state) {
+
+    // ---- IDLE ----
+    case AppState::Idle: {
+        led1((millis() / 500) % 2);
+        led2(false);
+
+        if (button_pressed()) {
+            // long-press detection for calibrate mode
+            const unsigned long start = millis();
+            while (digitalRead(PIN::BTN) == LOW) {
+                if (millis() - start > 2000) {
+                    g_state = AppState::Calibrate;
+                    Serial.println(">> CALIBRATE");
+                    return;
+                }
+            }
+            Serial.println(">> EXPLORE");
+            led1(true);
+            delay(CONFIG::STARTUP_DELAY_MS);
+
+            reset_pose_to_start();
+            Maze::init();
+            g_state = AppState::Exploring;
         }
-        
-        Serial.println(">> Starting EXPLORATION");
-        Serial.println("   Starting in 1 second...");
-        setLED1(true);
-        delay(CONFIG::STARTUP_DELAY_MS);
-        
-        // Reset position
-        mouseX = 0;
-        mouseY = 0;
-        mouseHeading = NORTH;
-        
-        // Initialize maze (clear old data)
-        Maze::init();
-        
-        currentState = STATE_EXPLORING;
-      }
-      break;
-    }
-    
-    // ---- EXPLORING: Navigate to center using flood-fill ----
-    case STATE_EXPLORING: {
-      setLED1(true);
-      setLED2(false);
-      
-      // Check for errors
-      if (Motors::isFault()) {
-        Serial.println("FAULT during exploration!");
-        Motors::stop();
-        currentState = STATE_ERROR;
         break;
-      }
-      
-      if (Sensors::isBatteryLow()) {
-        Serial.println("Low battery during exploration!");
-        Motors::stop();
-        currentState = STATE_ERROR;
+    }
+
+    // ---- EXPLORING ----
+    case AppState::Exploring: {
+        led1(true); led2(false);
+
+        if (mouse::g_mouse.motor_fault() || mouse::g_mouse.battery_low()) {
+            mouse::g_mouse.emergency_brake();
+            g_state = AppState::Error;
+            break;
+        }
+
+        cell_step(CONFIG::EXPLORE_SPEED_MMPS);
+
+        if (Maze::isGoal(g_cell_x, g_cell_y)) {
+            mouse::g_mouse.stop();
+            mouse::g_mouse.wait_until_done(1000);
+            Serial.println("=== GOAL REACHED ===");
+            Maze::printMaze();
+            g_state = AppState::Returning;
+        }
         break;
-      }
-      
-      // Execute one exploration step
-      exploreStep();
-      
-      // Check if we reached the goal
-      if (Maze::isGoal(mouseX, mouseY)) {
-        Motors::stop();
-        Serial.println("=============================");
-        Serial.println("  GOAL REACHED!");
-        Serial.println("=============================");
-        Maze::printMaze();
-        
-        Serial.println(">> Returning to start...");
-        delay(500);
-        currentState = STATE_RETURNING;
-      }
-      break;
     }
-    
-    // ---- RETURNING: Navigate back to (0,0) ----
-    case STATE_RETURNING: {
-      setLED1((millis() / 200) % 2);  // Fast blink
-      setLED2(false);
-      
-      if (Motors::isFault() || Sensors::isBatteryLow()) {
-        Motors::stop();
-        currentState = STATE_ERROR;
+
+    // ---- RETURNING ----
+    case AppState::Returning: {
+        led1((millis() / 200) % 2);
+        led2(false);
+
+        if (mouse::g_mouse.motor_fault() || mouse::g_mouse.battery_low()) {
+            mouse::g_mouse.emergency_brake();
+            g_state = AppState::Error;
+            break;
+        }
+
+        // sense + plan toward start
+        WallInfo wi = mouse::g_mouse.walls();
+        Maze::updateWalls(g_cell_x, g_cell_y, g_heading, wi);
+        Maze::floodFillToStart();
+        Direction target = Maze::bestDirection(g_cell_x, g_cell_y, g_heading);
+        execute_relative_turn(Maze::getRelativeTurn(g_heading, target));
+        g_heading = target;
+        mouse::g_mouse.forward_cells(1, CONFIG::EXPLORE_SPEED_MMPS);
+        mouse::g_mouse.wait_until_done(5000);
+
+        int nx, ny;
+        Maze::getNextCell(g_cell_x, g_cell_y, g_heading, nx, ny);
+        g_cell_x = nx; g_cell_y = ny;
+
+        if (g_cell_x == 0 && g_cell_y == 0) {
+            mouse::g_mouse.stop();
+            mouse::g_mouse.wait_until_done(1000);
+            Serial.println("=== BACK AT START -- press BTN for SPEED RUN ===");
+            g_state = AppState::Ready;
+        }
         break;
-      }
-      
-      // Flood fill targeting start
-      Maze::floodFillToStart();
-      
-      // Read walls and update maze
-      WallInfo wi = Sensors::detectWalls();
-      Maze::updateWalls(mouseX, mouseY, mouseHeading, wi);
-      
-      // Find best direction
-      Direction targetDir = Maze::bestDirection(mouseX, mouseY, mouseHeading);
-      
-      // Execute the move
-      executeMove(targetDir, CONFIG::EXPLORE_SPEED);
-      
-      // Check if we're back at start
-      if (mouseX == 0 && mouseY == 0) {
-        Motors::stop();
-        Serial.println("=============================");
-        Serial.println("  BACK AT START!");
-        Serial.println("  Press button for SPEED RUN");
-        Serial.println("=============================");
-        currentState = STATE_READY;
-      }
-      break;
     }
-    
-    // ---- READY: At start, waiting for speed run ----
-    case STATE_READY: {
-      setLED1(false);
-      setLED2((millis() / 500) % 2);  // Blink LED2
-      
-      if (buttonPressed()) {
-        Serial.println(">> Starting SPEED RUN");
-        Serial.println("   Starting in 1 second...");
-        setLED2(true);
-        delay(CONFIG::STARTUP_DELAY_MS);
-        
-        mouseX = 0;
-        mouseY = 0;
-        mouseHeading = NORTH;
-        
-        // Flood fill to goal with all discovered walls
-        Maze::floodFill(CONFIG::GOAL_X1, CONFIG::GOAL_Y1,
-                        CONFIG::GOAL_X2, CONFIG::GOAL_Y2);
-        
-        currentState = STATE_SPEED_RUN;
-      }
-      break;
-    }
-    
-    // ---- SPEED RUN: Fast navigation on known path ----
-    case STATE_SPEED_RUN: {
-      setLED1(false);
-      setLED2(true);
-      
-      if (Motors::isFault() || Sensors::isBatteryLow()) {
-        Motors::stop();
-        currentState = STATE_ERROR;
+
+    // ---- READY ----
+    case AppState::Ready: {
+        led1(false);
+        led2((millis() / 500) % 2);
+
+        if (button_pressed()) {
+            Serial.println(">> SPEED RUN");
+            led2(true);
+            delay(CONFIG::STARTUP_DELAY_MS);
+            reset_pose_to_start();
+            Maze::floodFill(CONFIG::GOAL_X1, CONFIG::GOAL_Y1,
+                            CONFIG::GOAL_X2, CONFIG::GOAL_Y2);
+            g_state = AppState::SpeedRun;
+        }
         break;
-      }
-      
-      speedRunStep();
-      
-      if (Maze::isGoal(mouseX, mouseY)) {
-        Motors::stop();
-        Serial.println("=============================");
-        Serial.println("  SPEED RUN COMPLETE!");
-        Serial.println("=============================");
-        currentState = STATE_IDLE;
-      }
-      break;
     }
-    
-    // ---- CALIBRATE: Print sensor values for tuning ----
-    case STATE_CALIBRATE: {
-      setLED1(true);
-      setLED2(true);
-      
-      Sensors::printValues();
-      delay(200);
-      
-      if (buttonPressed()) {
-        Serial.println(">> Exiting calibration");
-        currentState = STATE_IDLE;
-      }
-      break;
+
+    // ---- SPEED RUN ----
+    case AppState::SpeedRun: {
+        led1(false); led2(true);
+
+        if (mouse::g_mouse.motor_fault() || mouse::g_mouse.battery_low()) {
+            mouse::g_mouse.emergency_brake();
+            g_state = AppState::Error;
+            break;
+        }
+
+        cell_step(CONFIG::SPEED_RUN_MMPS);
+
+        if (Maze::isGoal(g_cell_x, g_cell_y)) {
+            mouse::g_mouse.stop();
+            mouse::g_mouse.wait_until_done(1000);
+            Serial.println("=== SPEED RUN COMPLETE ===");
+            g_state = AppState::Idle;
+        }
+        break;
     }
-    
-    // ---- ERROR: Flash both LEDs ----
-    case STATE_ERROR: {
-      Motors::stop();
-      bool on = (millis() / 150) % 2;
-      setLED1(on);
-      setLED2(on);
-      
-      // Print error info periodically
-      static unsigned long lastPrint = 0;
-      if (millis() - lastPrint > 2000) {
-        lastPrint = millis();
-        Serial.print("ERROR - Fault: "); Serial.print(Motors::isFault());
-        Serial.print(" Battery: ");      Serial.println(Sensors::readBatteryRaw());
-      }
-      
-      // Button press to return to idle
-      if (buttonPressed()) {
-        currentState = STATE_IDLE;
-      }
-      break;
+
+    // ---- CALIBRATE ----
+    case AppState::Calibrate: {
+        led1(true); led2(true);
+        mouse::g_mouse.print_diag();
+        delay(200);
+        if (button_pressed()) {
+            mouse::g_mouse.recalibrate_imu();
+            Serial.println(">> exit CALIBRATE");
+            g_state = AppState::Idle;
+        }
+        break;
     }
-  }
-}
 
-// ============================================================
-//  EXPLORATION STEP
-//  - Read walls at current position
-//  - Update maze
-//  - Run flood fill
-//  - Move to the cell with the lowest flood value
-// ============================================================
-void exploreStep() {
-  // 1) Read walls
-  WallInfo wi = Sensors::detectWalls();
-  
-  // 2) Update maze with discovered walls
-  Maze::updateWalls(mouseX, mouseY, mouseHeading, wi);
-  
-  Serial.print("Pos: ("); Serial.print(mouseX);
-  Serial.print(",");      Serial.print(mouseY);
-  Serial.print(") Heading: "); Serial.print(mouseHeading);
-  Serial.print(" Walls F:"); Serial.print(wi.front);
-  Serial.print(" L:");       Serial.print(wi.left);
-  Serial.print(" R:");       Serial.println(wi.right);
-  
-  // 3) Run flood fill to the goal
-  Maze::floodFill(CONFIG::GOAL_X1, CONFIG::GOAL_Y1,
-                  CONFIG::GOAL_X2, CONFIG::GOAL_Y2);
-  
-  // 4) Find best direction
-  Direction targetDir = Maze::bestDirection(mouseX, mouseY, mouseHeading);
-  
-  Serial.print("  Flood value: "); Serial.print(Maze::getFloodValue(mouseX, mouseY));
-  Serial.print(" -> Moving: ");    Serial.println(targetDir);
-  
-  // 5) Execute the move
-  executeMove(targetDir, CONFIG::EXPLORE_SPEED);
-}
+    // ---- ERROR ----
+    case AppState::Error: {
+        mouse::g_mouse.emergency_brake();
+        const bool on = (millis() / CONFIG::FAULT_BLINK_MS) % 2;
+        led1(on); led2(on);
 
-// ============================================================
-//  SPEED RUN STEP
-//  Uses pre-computed flood values (no re-computation each cell)
-// ============================================================
-void speedRunStep() {
-  // We already have the flood map calculated
-  Direction targetDir = Maze::bestDirection(mouseX, mouseY, mouseHeading);
-  executeMove(targetDir, CONFIG::SPEED_RUN_SPEED);
-}
-
-// ============================================================
-//  EXECUTE MOVE
-//  Turn to face the target direction, then move forward one cell
-// ============================================================
-void executeMove(Direction targetDir, int speed) {
-  RelativeDir turn = Maze::getRelativeTurn(mouseHeading, targetDir);
-  
-  // Execute the required turn
-  switch (turn) {
-    case REL_FORWARD:
-      // No turn needed
-      break;
-    case REL_RIGHT:
-      Motors::turnRight90(CONFIG::TURN_SPEED);
-      break;
-    case REL_LEFT:
-      Motors::turnLeft90(CONFIG::TURN_SPEED);
-      break;
-    case REL_BACK:
-      Motors::turnAround(CONFIG::TURN_SPEED);
-      break;
-  }
-  
-  // Update heading
-  mouseHeading = targetDir;
-  
-  // Move forward one cell
-  Motors::moveForwardCells(1, speed);
-  
-  // Update position
-  int nx, ny;
-  Maze::getNextCell(mouseX, mouseY, mouseHeading, nx, ny);
-  
-  // Sanity check (should never happen if maze is correct)
-  if (nx < 0 || nx >= CONFIG::MAZE_SIZE || ny < 0 || ny >= CONFIG::MAZE_SIZE) {
-    Serial.println("ERROR: Moved out of bounds!");
-    currentState = STATE_ERROR;
-    return;
-  }
-  
-  mouseX = nx;
-  mouseY = ny;
-}
-
-// ============================================================
-//  BUTTON HELPER
-// ============================================================
-bool buttonPressed() {
-  if (digitalRead(PIN::BTN) == LOW) {
-    if (millis() - lastButtonTime > CONFIG::BUTTON_DEBOUNCE_MS) {
-      lastButtonTime = millis();
-      return true;
+        static unsigned long last = 0;
+        if (millis() - last > 2000) {
+            last = millis();
+            Serial.printf("ERROR fault=%d batt_low=%d\n",
+                          (int)mouse::g_mouse.motor_fault(),
+                          (int)mouse::g_mouse.battery_low());
+        }
+        if (button_pressed()) g_state = AppState::Idle;
+        break;
     }
-  }
-  return false;
+
+    } // switch
 }

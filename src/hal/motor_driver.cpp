@@ -94,10 +94,18 @@ void MotorDriver::begin() {
     // FAULT is open-drain on the BDR6622T -> internal pull-up.
     pinMode(PIN::MOTOR_DRV_FAULT, INPUT_PULLUP);
 
-    // Global enable -- start disabled.
+    // Global enable -- start disabled so no shoot-through during pin config.
     pinMode(PIN::MOTOR_DRV_EN, OUTPUT);
     digitalWrite(PIN::MOTOR_DRV_EN, LOW);
     m_enabled = false;
+
+    // Force motor pins LOW before attaching LEDC to prevent glitches that
+    // could trip the BDR6622T overcurrent latch.
+    pinMode(PIN::MOTOR_A_1, OUTPUT); digitalWrite(PIN::MOTOR_A_1, LOW);
+    pinMode(PIN::MOTOR_A_2, OUTPUT); digitalWrite(PIN::MOTOR_A_2, LOW);
+    pinMode(PIN::MOTOR_B_1, OUTPUT); digitalWrite(PIN::MOTOR_B_1, LOW);
+    pinMode(PIN::MOTOR_B_2, OUTPUT); digitalWrite(PIN::MOTOR_B_2, LOW);
+    delay(5);  // let the driver IC settle with EN=LOW, inputs=LOW
 
     // Configure LEDC -- one path per Arduino-ESP32 major version (see shim
     // above).  Functionally identical.
@@ -118,11 +126,38 @@ void MotorDriver::begin() {
     ledcAttachPin(PIN::MOTOR_B_2, LEDC_CH_B2);
 #endif
 
+    // Ensure zero output after LEDC attach
     coast();
+    delay(2);
 }
 
 void MotorDriver::enable() {
+    // BDR6622T power-up sequence:
+    // Ensure inputs are coast, then cycle EN to clear any latched fault.
+    coast();
+    delay(2);
+
+    // Try active-HIGH enable (standard)
+    digitalWrite(PIN::MOTOR_DRV_EN, LOW);
+    delay(10);
     digitalWrite(PIN::MOTOR_DRV_EN, HIGH);
+    delay(10);
+
+    // If FAULT is still asserted, try active-LOW enable (some boards invert)
+    if (digitalRead(PIN::MOTOR_DRV_FAULT) == LOW) {
+        Serial.println("[motor] EN=HIGH -> FAULT, trying EN=LOW...");
+        digitalWrite(PIN::MOTOR_DRV_EN, LOW);
+        delay(10);
+        if (digitalRead(PIN::MOTOR_DRV_FAULT) == HIGH) {
+            Serial.println("[motor] EN=LOW works! Invert EN logic.");
+            // Keep EN LOW (active-low mode)
+        } else {
+            // Neither polarity clears fault — report and default to HIGH
+            Serial.printf("[motor] FAULT pin raw=%d (both EN states fault)\n",
+                          digitalRead(PIN::MOTOR_DRV_FAULT));
+            digitalWrite(PIN::MOTOR_DRV_EN, HIGH);
+        }
+    }
     m_enabled = true;
 }
 

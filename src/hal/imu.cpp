@@ -77,7 +77,7 @@ bool Imu::rd(uint8_t reg, uint8_t *buf, size_t n) {
     const size_t got = Wire.requestFrom(
         static_cast<int>(CONFIG::IMU_I2C_ADDRESS), static_cast<int>(n));
     if (got != n) return false;
-    for (size_t i = 0; i < n; ++i) buf[i] = Wire.read();
+    for (uint8_t i = 0; i < n; ++i) buf[i] = Wire.read();
     return true;
 }
 

@@ -115,6 +115,8 @@ void sensing_task(void *) {
         g_wall_snapshot.lateral_error = v.lateral_error;
         g_wall_snapshot.front_metric  = v.front_metric;
 
+        // Yield to IDLE task to prevent WDT starvation on core 0
+        vTaskDelay(1);
         vTaskDelayUntil(&last_wake, period);
     }
 }

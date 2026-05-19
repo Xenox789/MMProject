@@ -113,13 +113,13 @@ constexpr int   TICKS_PER_90_PIVOT =
 //    on the wrong side or its IN1/IN2 are swapped.
 // ---------------------------------------------------------------------------
 
-constexpr int   MOTOR_PWM_FREQ_HZ      = 20000;    // 20 kHz
+constexpr int   MOTOR_PWM_FREQ_HZ      = 5000;     // 5 kHz (longer pulses = more torque at low duty)
 constexpr int   MOTOR_PWM_RESOLUTION   = 10;       // bits  -> 1024 levels
 constexpr int   MOTOR_PWM_MAX_DUTY     = (1 << MOTOR_PWM_RESOLUTION) - 1;
 
-constexpr float MOTOR_DEADBAND_DUTY    = 0.05f;    // 5 % is a safe start
+constexpr float MOTOR_DEADBAND_DUTY    = 0.15f;    // 15 % -- below this the motor hums but won't spin
 constexpr float MOTOR_MAX_DUTY         = 0.95f;    // hard cap on commanded duty
-constexpr float MOTOR_SLEW_PER_MS      = 0.01f;    // 1 %/ms -> 0..100 % in 100 ms
+constexpr float MOTOR_SLEW_PER_MS      = 0.02f;    // 2 %/ms -> ramp faster for bring-up
 
 // --- Side / polarity selection (easy to flip during bring-up) --------------
 //  MOTOR_A_IS_LEFT  : if true, MOTOR_A drives the LEFT wheel and MOTOR_B the
@@ -247,7 +247,7 @@ constexpr int    IMU_SAMPLE_RATE_HZ    = 1000;    // gyro/accel ODR
 // ---------------------------------------------------------------------------
 
 constexpr int   CONTROL_LOOP_HZ        = 1000;     // 1 kHz wheel-velocity PID
-constexpr int   SENSING_LOOP_HZ        = 400;      // IR + IMU sampling rate
+constexpr int   SENSING_LOOP_HZ        = 100;      // IR sampling (4ch @ ~4ms each → keep <10ms)
 
 //  --- A) Wheel velocity PID -------------------------------------------------
 constexpr float WHEEL_PID_KP           = 0.0012f;  // duty per tick/s of error

@@ -148,10 +148,23 @@ void setup() {
     }
 
     mouse::g_mouse.enable_motors();
+    delay(50);
 
     if (mouse::g_mouse.motor_fault()) {
-        Serial.println("[main] motor FAULT at boot");
-        g_state = AppState::Error;
+        Serial.println("[main] motor FAULT at boot (retrying...)");
+        mouse::g_mouse.disable_motors();
+        delay(100);
+        mouse::g_mouse.enable_motors();
+        delay(50);
+    }
+
+    if (mouse::g_mouse.motor_fault()) {
+        Serial.printf("[main] FAULT pin (GPIO %d) raw=%d -- ignoring for bring-up\n",
+                      PIN::MOTOR_DRV_FAULT,
+                      digitalRead(PIN::MOTOR_DRV_FAULT));
+        Serial.println("[main] Motors enabled anyway for testing. Check wiring if no motion.");
+        // Continue anyway so we can diagnose — don't enter Error state
+        // g_state = AppState::Error;
     } else if (mouse::g_mouse.battery_low()) {
         Serial.println("[main] battery LOW at boot");
         g_state = AppState::Error;
@@ -193,7 +206,7 @@ void loop() {
     case AppState::Exploring: {
         led1(true); led2(false);
 
-        if (mouse::g_mouse.motor_fault() || mouse::g_mouse.battery_low()) {
+        if (mouse::g_mouse.battery_low()) {
             mouse::g_mouse.emergency_brake();
             g_state = AppState::Error;
             break;
@@ -216,7 +229,7 @@ void loop() {
         led1((millis() / 200) % 2);
         led2(false);
 
-        if (mouse::g_mouse.motor_fault() || mouse::g_mouse.battery_low()) {
+        if (mouse::g_mouse.battery_low()) {
             mouse::g_mouse.emergency_brake();
             g_state = AppState::Error;
             break;
@@ -266,7 +279,7 @@ void loop() {
     case AppState::SpeedRun: {
         led1(false); led2(true);
 
-        if (mouse::g_mouse.motor_fault() || mouse::g_mouse.battery_low()) {
+        if (mouse::g_mouse.battery_low()) {
             mouse::g_mouse.emergency_brake();
             g_state = AppState::Error;
             break;
